@@ -14,6 +14,7 @@ import os
 import unittest
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Union
+from unittest.mock import patch
 
 import hypothesis.strategies as st
 import torch
@@ -22,6 +23,7 @@ import torchrec
 import torchrec.distributed.comm_ops as comm_ops
 from hypothesis import given, settings
 from torch.distributed.distributed_c10d import GroupMember
+from torchrec.distributed.comm import get_resolved_pod_size
 from torchrec.test_utils import get_free_port, seed_and_log
 
 torch.ops.import_module("fbgemm_gpu.sparse_ops")
@@ -698,3 +700,52 @@ class TestAllToAll(unittest.TestCase):
             # pyrefly: ignore[bad-argument-type]
             callable=self._test_all_gather_base_pooled_cpu,
         )
+
+
+class TestResolvedPodSize(unittest.TestCase):
+    """
+    pod_size is the multiplier that makes the runtime's TwRw/Grid node width match
+    the planner's Topology.intra_group_size. It is absent on every SKU whose NVLink
+    domain is a single host, so these cases pin the unset default as tightly as the
+    NVL72 values -- a regression there silently narrows the runtime group and drops
+    embedding shards rather than failing.
+    """
+
+    def test_unset_is_none_so_non_nvl72_skus_are_unaffected(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(get_resolved_pod_size())
+
+    def test_reads_planner_resolved_value(self) -> None:
+        for raw, expected in (("1", 1), ("2", 2), ("4", 4), ("18", 18), ("36", 36)):
+            with self.subTest(raw=raw), patch.dict(
+                os.environ, {"TORCHREC_RESOLVED_POD_SIZE": raw}, clear=True
+            ):
+                self.assertEqual(get_resolved_pod_size(), expected)
+
+    def test_rejects_non_positive_instead_of_zeroing_the_node_width(self) -> None:
+        # A 0 would zero devices_per_node and turn the callers' divisibility checks
+        # into a ZeroDivisionError, hiding the misconfiguration.
+        for raw in ("0", "-1"):
+            with self.subTest(raw=raw), patch.dict(
+                os.environ, {"TORCHREC_RESOLVED_POD_SIZE": raw}, clear=True
+            ):
+                with self.assertRaisesRegex(ValueError, "must be a positive integer"):
+                    get_resolved_pod_size()
+
+    def test_rejects_non_numeric_with_the_same_descriptive_error(self) -> None:
+        # Otherwise a typo'd launcher value surfaces as a bare
+        # "invalid literal for int()" that names neither the variable nor the value.
+        for raw in ("abc", "", "2.5"):
+            with self.subTest(raw=raw), patch.dict(
+                os.environ, {"TORCHREC_RESOLVED_POD_SIZE": raw}, clear=True
+            ):
+                with self.assertRaisesRegex(ValueError, "must be a positive integer"):
+                    get_resolved_pod_size()
+
+    def test_topology_domain_multiple_alone_does_not_set_pod_size(self) -> None:
+        # Parity with the 1D path (get_topology_group_world_size): only the
+        # planner-exported TORCHREC_RESOLVED_POD_SIZE is authoritative, because
+        # TOPOLOGY_DOMAIN_MULTIPLE is the configured *minimum* and can disagree
+        # with the placement MAST actually gave the job.
+        with patch.dict(os.environ, {"TOPOLOGY_DOMAIN_MULTIPLE": "36"}, clear=True):
+            self.assertIsNone(get_resolved_pod_size())
